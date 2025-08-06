@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 import logging
+from pathlib import Path
 
 from src.ai.claude_client import ClaudeNeptuneClient, GenerationConfig
 from src.templates.prompts import RothfussPrompts, CharacterProfile
@@ -44,8 +45,16 @@ class StoryEngine:
         self.context_window: List[str] = []
         self.max_context_size = 50000  # символов
         
+        # База знаний о мире
+        self.story_bible: Optional[Dict] = None
+        self.chapter_summaries: List[Dict] = []
+        self.generation_context: Optional[Dict] = None
+        
         # Загружаем персонажей
         self._initialize_characters()
+        
+        # Пытаемся загрузить базу знаний, если она существует
+        self._load_knowledge_base()
         
     def _initialize_characters(self):
         """Инициализация основных персонажей"""
@@ -103,6 +112,52 @@ class StoryEngine:
                 }
             )
         }
+    
+    def _load_knowledge_base(self):
+        """Загружает базу знаний, если она существует"""
+        analysis_dir = Path("analysis_output")
+        
+        # Загружаем библию мира
+        bible_path = analysis_dir / "story_bible.json"
+        if bible_path.exists():
+            with open(bible_path, 'r', encoding='utf-8') as f:
+                self.story_bible = json.load(f)
+                logger.info("Загружена библия мира")
+                
+                # Обновляем персонажей из библии
+                self._update_characters_from_bible()
+        
+        # Загружаем краткие содержания
+        summaries_path = analysis_dir / "chapter_summaries.json"
+        if summaries_path.exists():
+            with open(summaries_path, 'r', encoding='utf-8') as f:
+                self.chapter_summaries = json.load(f)
+                logger.info(f"Загружено {len(self.chapter_summaries)} кратких содержаний")
+        
+        # Загружаем контекст для генерации
+        context_path = analysis_dir / "generation_context.json"
+        if context_path.exists():
+            with open(context_path, 'r', encoding='utf-8') as f:
+                self.generation_context = json.load(f)
+                logger.info("Загружен контекст для генерации")
+    
+    def _update_characters_from_bible(self):
+        """Обновляет информацию о персонажах из библии мира"""
+        if not self.story_bible:
+            return
+        
+        all_characters = {}
+        for category in ["protagonists", "antagonists", "supporting"]:
+            if category in self.story_bible.get("characters", {}):
+                all_characters.update(self.story_bible["characters"][category])
+        
+        for char_name, char_data in all_characters.items():
+            if char_name in self.characters:
+                # Обновляем существующего персонажа
+                self.characters[char_name].description = char_data.get("description", "")
+                self.characters[char_name].relationships = char_data.get("relationships", {})
+                if char_data.get("key_quotes"):
+                    self.characters[char_name].speech_patterns.extend(char_data["key_quotes"][:3])
     
     def start_session(self) -> str:
         """Начало новой сессии генерации"""
@@ -198,11 +253,32 @@ class StoryEngine:
             raise
     
     def _prepare_chapter_context(self, config: ChapterConfig) -> str:
-        """Подготовка контекста для главы"""
+        """Подготовка контекста для главы с использованием базы знаний"""
         context_parts = []
         
-        # Добавляем краткое содержание предыдущих глав
-        if config.chapter_number > 1:
+        # Если есть база знаний, используем её
+        if self.story_bible:
+            # Добавляем информацию о мире
+            world_info = f"МИР: {self.story_bible['world']['name']}\n"
+            world_info += f"МАГИЯ: {', '.join(self.story_bible['world']['magic_systems'])}"
+            context_parts.append(world_info)
+            
+            # Добавляем активные тайны
+            if self.story_bible.get("mysteries"):
+                mysteries = self.story_bible["mysteries"]["major"][:3]
+                context_parts.append(f"НЕРАЗРЕШЁННЫЕ ТАЙНЫ: {', '.join(mysteries)}")
+        
+        # Добавляем краткие содержания предыдущих глав из анализа
+        if self.chapter_summaries and len(self.chapter_summaries) > 0:
+            # Берём последние 3 главы
+            recent_summaries = self.chapter_summaries[-3:]
+            summaries_text = "ПРЕДЫДУЩИЕ СОБЫТИЯ:\n"
+            for summary in recent_summaries:
+                summaries_text += f"- Глава {summary['chapter']}: {summary['summary'][:200]}...\n"
+            context_parts.append(summaries_text)
+        
+        # Добавляем краткое содержание предыдущих сгенерированных глав
+        elif config.chapter_number > 1:
             prev_chapter = config.chapter_number - 1
             if prev_chapter in self.generated_chapters:
                 prev_text = self.generated_chapters[prev_chapter]
@@ -216,6 +292,12 @@ class StoryEngine:
                     context_parts.append(f"Состояние Денны: {self.characters['denna'].current_state}")
                 if "Баст" in scene:
                     context_parts.append(f"Состояние Баста: {self.characters['bast'].current_state}")
+        
+        # Добавляем стилистические элементы из анализа
+        if self.generation_context:
+            style_notes = self.generation_context.get("style_notes", {})
+            if style_notes.get("signature_elements"):
+                context_parts.append(f"ФИРМЕННЫЕ ЭЛЕМЕНТЫ: {', '.join(style_notes['signature_elements'])}")
         
         # Добавляем напоминание о стиле
         if config.narrative_type == "frame" and config.chapter_number % 5 == 1:
